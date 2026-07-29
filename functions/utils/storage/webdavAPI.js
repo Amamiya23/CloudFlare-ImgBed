@@ -85,15 +85,16 @@ export class WebDAVAPI {
     }
 
     async getFile(path, options = {}) {
-        const response = await fetch(this.buildObjectUrl(path), {
-            method: options.method || 'GET',
-            headers: this.getRequestHeaders(options.headers || {}),
-            redirect: 'manual',
-        });
+        const method = options.method || 'GET';
+        const response = await fetchWithReadRedirects(
+            this.buildObjectUrl(path),
+            method,
+            this.getRequestHeaders(options.headers || {})
+        );
 
         if (!isSuccessStatus(response.status) && response.status !== 304) {
             const detail = await safeReadResponseText(response);
-            throw new Error(`WebDAV ${options.method || 'GET'} failed: ${response.status} ${response.statusText}${detail ? ` - ${detail}` : ''}`);
+            throw new Error(`WebDAV ${method} failed: ${response.status} ${response.statusText}${detail ? ` - ${detail}` : ''}`);
         }
 
         return response;
@@ -212,6 +213,72 @@ function normalizeHeaders(headers) {
 
 function isSuccessStatus(status) {
     return status >= 200 && status < 300;
+}
+
+const READ_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const MAX_READ_REDIRECTS = 5;
+const CROSS_ORIGIN_READ_HEADERS = [
+    'Accept',
+    'Accept-Encoding',
+    'If-Match',
+    'If-Modified-Since',
+    'If-None-Match',
+    'If-Range',
+    'If-Unmodified-Since',
+    'Range',
+];
+
+async function fetchWithReadRedirects(initialUrl, method, initialHeaders) {
+    let currentUrl = new URL(initialUrl);
+    let headers = new Headers(initialHeaders);
+
+    for (let redirectCount = 0; redirectCount <= MAX_READ_REDIRECTS; redirectCount++) {
+        const response = await fetch(currentUrl.toString(), {
+            method,
+            headers,
+            redirect: 'manual',
+        });
+
+        if (!READ_REDIRECT_STATUSES.has(response.status)) {
+            return response;
+        }
+
+        const location = response.headers.get('Location');
+        if (!location) {
+            return response;
+        }
+
+        if (redirectCount === MAX_READ_REDIRECTS) {
+            throw new Error(`WebDAV ${method} failed: too many redirects (maximum ${MAX_READ_REDIRECTS})`);
+        }
+
+        const nextUrl = new URL(location, currentUrl);
+        if (!['http:', 'https:'].includes(nextUrl.protocol)) {
+            throw new Error(`WebDAV ${method} redirect must use http or https`);
+        }
+
+        // OpenList commonly redirects WebDAV reads to an object-storage URL.
+        // Only forward ordinary read/conditional headers to a different origin;
+        // WebDAV credentials may also be stored in custom headers.
+        if (nextUrl.origin !== currentUrl.origin) {
+            headers = getCrossOriginReadHeaders(headers);
+        }
+
+        currentUrl = nextUrl;
+    }
+
+    throw new Error(`WebDAV ${method} failed: too many redirects (maximum ${MAX_READ_REDIRECTS})`);
+}
+
+function getCrossOriginReadHeaders(headers) {
+    const safeHeaders = new Headers();
+    for (const name of CROSS_ORIGIN_READ_HEADERS) {
+        const value = headers.get(name);
+        if (value !== null) {
+            safeHeaders.set(name, value);
+        }
+    }
+    return safeHeaders;
 }
 
 async function safeReadResponseText(response) {
